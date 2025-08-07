@@ -20,6 +20,7 @@
 import glob
 import importlib.util
 import json
+import logging
 import pathlib
 import sys
 from itertools import chain
@@ -31,6 +32,15 @@ from invesalius.pubsub import pub as Publisher
 
 if TYPE_CHECKING:
     import os
+
+# Setup logger for the plugin manager
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+handler = logging.StreamHandler()
+formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
 
 def import_source(module_name: str, module_file_path: "str | bytes | os.PathLike") -> ModuleType:
@@ -54,36 +64,52 @@ class PluginManager:
 
     def find_plugins(self) -> None:
         self.plugins = {}
-        for p in chain(
+        plugin_json_paths = chain(
             glob.glob(str(inv_paths.PLUGIN_DIRECTORY.joinpath("**/plugin.json")), recursive=True),
-            glob.glob(
-                str(inv_paths.USER_PLUGINS_DIRECTORY.joinpath("**/plugin.json")), recursive=True
-            ),
-        ):
-            try:
-                p = pathlib.Path(p)
-                with p.open() as f:
-                    jdict = json.load(f)
-                    plugin_name = jdict["name"]
-                    plugin_description = jdict["description"]
-                    enable_startup = jdict.get("enable-startup", False)
+            glob.glob(str(inv_paths.USER_PLUGINS_DIRECTORY.joinpath("**/plugin.json")), recursive=True),
+        )
 
-                    self.plugins[plugin_name] = {
-                        "name": plugin_name,
-                        "description": plugin_description,
-                        "folder": p.parent,
-                        "enable_startup": enable_startup,
-                    }
-            except Exception as err:
-                print(f"It was not possible to load plugin. Error: {err}")
+        for plugin_path_str in plugin_json_paths:
+            plugin_path = pathlib.Path(plugin_path_str)
+
+            try:
+                with plugin_path.open(encoding="utf-8") as f:
+                    jdict = json.load(f)
+
+                plugin_name = jdict["name"]
+                plugin_description = jdict["description"]
+                enable_startup = jdict.get("enable-startup", False)
+
+                self.plugins[plugin_name] = {
+                    "name": plugin_name,
+                    "description": plugin_description,
+                    "folder": plugin_path.parent,
+                    "enable_startup": enable_startup,
+                }
+
+            except FileNotFoundError:
+                logger.warning(f"Plugin file not found: {plugin_path}")
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse JSON for plugin at {plugin_path}: {e}")
+            except KeyError as e:
+                logger.warning(f"Missing required key in plugin.json ({plugin_path}): {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error loading plugin at {plugin_path}: {e}", exc_info=True)
 
         Publisher.sendMessage("Add plugins menu items", items=self.plugins)
 
     def load_plugin(self, plugin_name: str) -> None:
         if plugin_name in self.plugins:
-            plugin_module = import_source(
-                plugin_name, self.plugins[plugin_name]["folder"].joinpath("__init__.py")
-            )
-            sys.modules[plugin_name] = plugin_module
-            main = importlib.import_module(plugin_name + ".main")
-            main.load()
+            try:
+                plugin_module = import_source(
+                    plugin_name, self.plugins[plugin_name]["folder"].joinpath("__init__.py")
+                )
+                sys.modules[plugin_name] = plugin_module
+                main = importlib.import_module(plugin_name + ".main")
+                main.load()
+            except FileNotFoundError as e:
+                logger.error(f"Plugin file missing for {plugin_name}: {e}")
+            except ModuleNotFoundError as e:
+                logger.error(f"Main module missing in plugin {plugin_name}: {e}")
+            except Exception as e:
+                logger.exception(f"Unexpected error while loading plugin '{plugin_name}': {e}")
